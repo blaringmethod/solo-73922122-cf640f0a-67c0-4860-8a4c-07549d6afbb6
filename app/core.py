@@ -17,6 +17,7 @@ results arriving after a stop cannot falsify the log.
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import time
 import uuid
@@ -35,6 +36,44 @@ BASELINE_BATCHES = [(1, True), (2, False)]
 BASELINE_READINGS = [(1, 1, 10.5), (2, 1, 11.0), (3, 1, 9.8)]
 
 _SHUTDOWN = object()  # queue sentinel telling a worker to wind down
+
+# Transaction-control statements executed *as SQL* that end the current
+# transaction.  COMMIT/ROLLBACK (and their aliases END/ABORT) commit or abort
+# the current transaction; WITH CHAIN the server immediately opens a NEW
+# transaction on the same connection, so later steps must never be treated as
+# part of the original transaction.  Note that ROLLBACK TO SAVEPOINT (and
+# RELEASE/SAVEPOINT) do NOT match: the original transaction keeps running.
+_COMMIT_RE = re.compile(
+    r"^(?:COMMIT|END)(?:\s+(?:WORK|TRANSACTION))?\s*$", re.IGNORECASE)
+_ROLLBACK_RE = re.compile(
+    r"^(?:ROLLBACK|ABORT)(?:\s+(?:WORK|TRANSACTION))?\s*$", re.IGNORECASE)
+_CHAIN_RE = re.compile(r"\bAND\s+CHAIN\b", re.IGNORECASE)
+
+
+def classify_tx_control(sql: str) -> str | None:
+    """Classify a single SQL statement that ends the current transaction.
+
+    Returns ``"commit"`` / ``"rollback"`` for COMMIT/ROLLBACK (including the
+    ``... AND CHAIN`` forms and the END/ABORT aliases), otherwise ``None``.
+    ``ROLLBACK TO SAVEPOINT`` deliberately returns ``None``: it only undoes
+    work back to a savepoint and the original transaction stays open.
+    """
+    s = sql.strip()
+    if s.endswith(";"):
+        s = s[:-1].rstrip()
+    chained = bool(_CHAIN_RE.search(s))
+    if chained:
+        s = _CHAIN_RE.sub("", s).rstrip()
+    if _COMMIT_RE.match(s):
+        return "commit"
+    if _ROLLBACK_RE.match(s):
+        return "rollback"
+    return None
+
+
+def is_chained(sql: str) -> bool:
+    """True for ``COMMIT AND CHAIN`` / ``ROLLBACK AND CHAIN`` style statements."""
+    return bool(_CHAIN_RE.search(sql.strip().rstrip(";").rstrip()))
 
 
 def utcnow_iso() -> str:
@@ -89,19 +128,21 @@ class TxWorker(threading.Thread):
 
     # ---- worker thread body ----
     def run(self) -> None:
+        # Everything runs under one try/finally so that a failed connect also
+        # reaches _cleanup()/tx_closed() and the round never waits forever.
         try:
-            self.conn = psycopg2.connect(self.dsn)
-            self.conn.autocommit = False
-            self.backend_pid = self.conn.get_backend_pid()
-            with self.conn.cursor() as cur:
-                cur.execute(f'SET search_path TO "{self.rnd.schema}"')
-            self.conn.commit()
-            self.rnd.tx_ready(self.tx_name)
-        except Exception as exc:  # connection could not be established
-            self.connect_error = exc
-            self.rnd.tx_connect_failed(self.tx_name, exc)
-            return
-        try:
+            try:
+                self.conn = psycopg2.connect(self.dsn)
+                self.conn.autocommit = False
+                self.backend_pid = self.conn.get_backend_pid()
+                with self.conn.cursor() as cur:
+                    cur.execute(f'SET search_path TO "{self.rnd.schema}"')
+                self.conn.commit()
+                self.rnd.tx_ready(self.tx_name)
+            except Exception as exc:  # connection could not be established
+                self.connect_error = exc
+                self.rnd.tx_connect_failed(self.tx_name, exc)
+                return
             while True:
                 item = self.q.get()
                 if item is _SHUTDOWN:
@@ -113,12 +154,20 @@ class TxWorker(threading.Thread):
                         error="round stopped before this step started",
                     )
                     continue
-                self._run_item(item)
+                tx_ended = self._run_item(item)
                 if self.conn is None or self.conn.closed:
                     # Connection is gone.  We must NOT reconnect to impersonate
                     # the original transaction; drain what is left as canceled.
                     self.rnd.tx_connection_lost(self.tx_name)
                     self._drain("connection lost; step not executed")
+                    break
+                if tx_ended:
+                    # A COMMIT/ROLLBACK (optionally AND CHAIN) executed as SQL
+                    # finished the original transaction.  Everything still
+                    # queued belongs to that finished transaction and must not
+                    # run - not against the chained transaction, not at all.
+                    self._drain(
+                        "transaction ended by SQL; queued steps were not executed")
                     break
         finally:
             self._cleanup()
@@ -133,21 +182,44 @@ class TxWorker(threading.Thread):
                 return
             self.rnd.finalize_step(pending["rec"], "canceled", error=message)
 
-    def _run_item(self, item: dict) -> None:
+    def _run_item(self, item: dict) -> bool:
+        """Execute one queued item.
+
+        Returns True when the original transaction has ended and the worker
+        must wind down (SQL-level commit/rollback), False otherwise.
+        """
         rec, kind, sql = item["rec"], item["kind"], item.get("sql")
         self.rnd.mark_running(rec)
         self.running = True
         try:
             if kind == "sql":
-                self.rnd.finalize_step(rec, "done", result=self._exec_sql(sql))
-            elif kind == "commit":
+                tx_ctl = classify_tx_control(sql)
+                if tx_ctl is None:
+                    self.rnd.finalize_step(
+                        rec, "done", result=self._exec_sql(sql))
+                    return False
+                result = self._exec_tx_control(sql, tx_ctl)
+                self.rnd.finalize_step(rec, "done", result=result)
+                # The database itself decided the original transaction's fate.
+                outcome = "committed" if tx_ctl == "commit" else "rolled_back"
+                detail = None
+                if result["chained"]:
+                    detail = (
+                        f"{outcome} via SQL with AND CHAIN; the server-opened "
+                        "follow-up transaction was rolled back and the "
+                        "connection released; queued steps were canceled")
+                self.rnd.tx_finished(self.tx_name, outcome, detail=detail)
+                return True
+            if kind == "commit":
                 self.conn.commit()
                 self.rnd.finalize_step(rec, "done", result={"outcome": "committed"})
                 self.rnd.tx_finished(self.tx_name, "committed")
-            elif kind == "rollback":
-                self.conn.rollback()
-                self.rnd.finalize_step(rec, "done", result={"outcome": "rolled_back"})
-                self.rnd.tx_finished(self.tx_name, "rolled_back")
+                return False
+            # kind == "rollback"
+            self.conn.rollback()
+            self.rnd.finalize_step(rec, "done", result={"outcome": "rolled_back"})
+            self.rnd.tx_finished(self.tx_name, "rolled_back")
+            return False
         except psycopg2.Error as exc:
             # Raw database error, kept verbatim for the record.  The
             # transaction (if any) is now aborted on THIS connection; it is
@@ -158,10 +230,12 @@ class TxWorker(threading.Thread):
                 error_class=type(exc).__name__,
                 pgcode=getattr(exc, "pgcode", None),
             )
+            return False
         except Exception as exc:  # e.g. InterfaceError on a broken connection
             self.rnd.finalize_step(
                 rec, "error", error=str(exc), error_class=type(exc).__name__,
             )
+            return False
         finally:
             self.running = False
 
@@ -179,6 +253,29 @@ class TxWorker(threading.Thread):
                     "truncated": truncated,
                 }
             return {"rowcount": cur.rowcount, "status": cur.statusmessage}
+
+    def _exec_tx_control(self, sql: str, tx_ctl: str) -> dict:
+        """Execute a COMMIT/ROLLBACK statement (optionally AND CHAIN) as SQL.
+
+        The statement is run verbatim so the database result is authoritative.
+        With AND CHAIN the server starts a brand-new transaction on the same
+        connection; _cleanup() rolls that follow-up transaction back and closes
+        the connection when the worker winds down.
+        """
+        chained = is_chained(sql)
+        with self.conn.cursor() as cur:
+            cur.execute(sql)
+            result = {
+                "outcome": "committed" if tx_ctl == "commit" else "rolled_back",
+                "via": "sql",
+                "chained": chained,
+                "status": cur.statusmessage,
+            }
+        if chained:
+            result["follow_up"] = (
+                "a new transaction was opened by AND CHAIN; it is rolled back "
+                "and the connection is released; steps still queued are canceled")
+        return result
 
     def _cleanup(self) -> None:
         conn, self.conn = self.conn, None
@@ -211,7 +308,8 @@ class Round:
         self.records: list[dict] = []
         self.seq = 0
         self.txs = {
-            name: {"state": "not_started", "worker": None, "closing": False, "detail": None}
+            name: {"state": "not_started", "worker": None, "closing": False,
+                   "detail": None, "released": False}
             for name in ("A", "B")
         }
 
@@ -284,9 +382,12 @@ class Round:
             slot["worker"].ready_event.set()
         self._maybe_finish()
 
-    def tx_finished(self, tx: str, outcome: str) -> None:
+    def tx_finished(self, tx: str, outcome: str, detail: str | None = None) -> None:
         with self.lock:
-            self.txs[tx]["state"] = outcome  # committed | rolled_back
+            slot = self.txs[tx]
+            slot["state"] = outcome  # committed | rolled_back
+            if detail is not None:
+                slot["detail"] = detail
 
     def tx_connection_lost(self, tx: str) -> None:
         with self.lock:
@@ -300,6 +401,7 @@ class Round:
             slot = self.txs[tx]
             if slot["state"] not in ("committed", "rolled_back", "dead"):
                 slot["state"] = "closed"  # was open; rolled back and released
+            slot["released"] = True
         self._maybe_finish()
 
     def mark_running(self, rec: dict) -> None:
@@ -340,8 +442,12 @@ class Round:
             if self.state != "stopping" or self.cleanup_started:
                 return
             for slot in self.txs.values():
-                if slot["state"] not in IDLE_TX_STATES:
-                    return  # a path is still running / holding a connection
+                if slot["state"] not in IDLE_TX_STATES or not slot["released"]:
+                    # A path is still running / still holding a connection.
+                    # A never-started path has nothing to release.
+                    if slot["state"] == "not_started":
+                        continue
+                    return  # wait until its worker closed the connection
             # Both SQL paths ended, uncommitted work was rolled back and the
             # connections were released.  Run the cleanup exactly once.
             self.cleanup_started = True

@@ -138,7 +138,15 @@ def run_sql(round_id: str, body: SqlIn, tx: str = Path(pattern="^[ABab]$")):
     """The statement runs on this transaction's dedicated connection.  The
     call returns immediately with the step record (status `queued`); poll
     `GET /rounds/{round_id}/steps/{seq}` for the outcome.  A blocked
-    statement does not prevent the other transaction from proceeding."""
+    statement does not prevent the other transaction from proceeding.
+
+    Transaction-control statements are handled by their real database
+    effect: `COMMIT`/`ROLLBACK` (including `... AND CHAIN` and the
+    END/ABORT aliases) end the current transaction, so the path is marked
+    committed/rolled_back per the database result, steps still queued are
+    canceled, and with AND CHAIN the server-opened follow-up transaction is
+    rolled back and the connection released. `ROLLBACK TO SAVEPOINT` does
+    not end the transaction and is executed like any other statement."""
     rnd = get_round_or_404(round_id)
     sql = check_single_statement(body.sql)
     try:
